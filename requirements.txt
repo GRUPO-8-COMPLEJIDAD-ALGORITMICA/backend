@@ -1,0 +1,6 @@
+geopandas
+pandas
+networkx
+folium
+scikit-learn
+ipython
