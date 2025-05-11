@@ -8,7 +8,7 @@ from sklearn.neighbors import BallTree
 import numpy as np
 
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Radio de la tierra en km
+    R = 6371  # km
     lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
     dlon = lon2 - lon1
     dlat = lat2 - lat1
@@ -25,83 +25,76 @@ except FileNotFoundError as e:
     print(f"Error al cargar archivos shapefile: {e}")
     exit()
 
-# --- Preparar datos ---
+# --- Preparar puntos ---
 riesgo["tipo"] = "riesgo"
 recursos["tipo"] = "recurso"
 riesgo = riesgo.loc[:, ~riesgo.columns.duplicated()].reset_index(drop=True)
 recursos = recursos.loc[:, ~recursos.columns.duplicated()].reset_index(drop=True)
 
-# Seleccionar un nodo de riesgo específico (por ejemplo, el primero)
-nodo_riesgo_index = 0
+# Seleccionar un nodo de riesgo estático (por ejemplo, el primer nodo de riesgo)
+nodo_riesgo_index = 0  # El índice del nodo de riesgo que queremos usar
 if nodo_riesgo_index >= len(riesgo):
-    print(f"Índice de nodo de riesgo fuera de rango: {nodo_riesgo_index}")
+    print(f"Error: El índice de nodo de riesgo {nodo_riesgo_index} está fuera de rango.")
     exit()
-
 nodo_riesgo = riesgo.iloc[nodo_riesgo_index]
 riesgo_point = nodo_riesgo.geometry
 
-# --- Buscar recursos cercanos con BallTree ---
+# --- Crear BallTree para búsqueda de vecinos cercanos ---
 recursos_coords = np.array([[geom.y, geom.x] for geom in recursos.geometry])
-tree = BallTree(np.radians(recursos_coords), metric='haversine')
-radio_km = 5
-indices_cercanos = tree.query_radius(np.radians([[riesgo_point.y, riesgo_point.x]]), r=radio_km / 6371.0)[0]
+tree_recursos = BallTree(np.radians(recursos_coords), metric='haversine')  # en radianes
+
+# Buscar nodos de respuesta cercanos al nodo de riesgo (radio en km)
+radio_busqueda = 5  # 5 kilómetros
+indices_cercanos = tree_recursos.query_radius(np.radians([[riesgo_point.y, riesgo_point.x]]), r=radio_busqueda / 6371.0)[0]
 
 # --- Crear grafo ---
 G = nx.Graph()
-G.add_node("riesgo", geometry=riesgo_point, tipo="riesgo", nombre=nodo_riesgo.get("nombre", "riesgo"))
+G.add_node(f"riesgo_{nodo_riesgo_index}", geometry=riesgo_point, tipo="riesgo", nombre=nodo_riesgo.get("nombre", f"Riesgo_{nodo_riesgo_index}"))
 
-# --- Índice espacial de caminos para optimizar ---
-caminos_sindex = caminos.sindex
-
+# --- Conectar nodos de respuesta cercanos ---
+nodos_respuesta_cercanos = []
 for idx in indices_cercanos:
-    recurso = recursos.iloc[idx]
-    geom = recurso.geometry
-    node_id = f"recurso_{idx}"
-
-    # Buscar solo caminos cercanos al recurso (usando bounding box)
-    buffer_geom = geom.buffer(0.005)  # Aproximadamente 500 m
-    posibles_idx = list(caminos_sindex.intersection(buffer_geom.bounds))
-
-    conectado = False
-    for cidx in posibles_idx:
-        camino = caminos.iloc[cidx]
-        if geom.distance(camino.geometry) < 0.005:
-            dist = haversine(riesgo_point.y, riesgo_point.x, geom.y, geom.x)
-            G.add_node(node_id, geometry=geom, tipo="recurso", nombre=recurso.get("nombre", node_id))
-            G.add_edge("riesgo", node_id, weight=dist)
-            conectado = True
-            break  # Solo una conexión válida es suficiente
+    recurso_cercano = recursos.iloc[idx]
+    node_id = f"recurso_cercano_{idx}"
+    G.add_node(node_id, geometry=recurso_cercano.geometry, tipo="recurso_cercano", nombre=recurso_cercano.get("nombre", f"Recurso_cercano_{idx}"))
+    nodos_respuesta_cercanos.append(node_id)
+    dist = haversine(riesgo_point.y, riesgo_point.x, recurso_cercano.geometry.y, recurso_cercano.geometry.x)
+    G.add_edge(f"riesgo_{nodo_riesgo_index}", node_id, weight=dist)
 
 # --- Crear mapa ---
-centro = riesgo_point
-m = folium.Map(location=[centro.y, centro.x], zoom_start=13)
+centro = recursos.geometry.unary_union.centroid if not recursos.empty else riesgo_point
+m = folium.Map(location=[centro.y, centro.x], zoom_start=10)
 
-# Agregar nodo de riesgo (rojo)
-folium.Marker(
-    [riesgo_point.y, riesgo_point.x],
-    popup=f"Riesgo: {nodo_riesgo.get('nombre', 'riesgo')}",
-    icon=folium.Icon(color="red")
-).add_to(m)
+# Añadir las zonas de riesgo al mapa (rojo)
+folium.GeoJson(riesgo, name="Zonas de Riesgo", style_function=lambda x: {"color": "red", "fillColor": "red", "fillOpacity": 0.2}).add_to(m)
 
-# Agregar nodos de respuesta (verde si conectados, negro si no)
+# Añadir los nodos de respuesta
 for i, row in recursos.iterrows():
-    color = "green" if f"recurso_{i}" in G.nodes else "black"
+    color = "green" if i in indices_cercanos else "black"
     folium.CircleMarker(
-        location=[row.geometry.y, row.geometry.x],
+        location=[row['geometry'].y, row['geometry'].x],
         radius=5,
         color=color,
         fill=True,
         fill_color=color,
         fill_opacity=0.7,
-        popup=f"Recurso: {row.get('nombre', i)}"
+        popup=f"Recurso {row.get('nombre', i)}"
     ).add_to(m)
 
-# Dibujar aristas (azul)
+# Dibujar las aristas del grafo (azul)
 for u, v, data in G.edges(data=True):
-    p1 = G.nodes[u]["geometry"]
-    p2 = G.nodes[v]["geometry"]
-    folium.PolyLine([(p1.y, p1.x), (p2.y, p2.x)], color="blue", weight=2).add_to(m)
+    if u in G.nodes and v in G.nodes:
+        p1 = G.nodes[u]['geometry']
+        p2 = G.nodes[v]['geometry']
+        folium.PolyLine([(p1.y, p1.x), (p2.y, p2.x)], color="blue", weight=1).add_to(m)
 
-# Guardar
-m.save("grafo_riesgo_con_recursos.html")
-print("Mapa creado: grafo_riesgo_con_recursos.html")
+# Añadir el nodo de riesgo al mapa (marcador rojo)
+folium.Marker(
+    [riesgo_point.y, riesgo_point.x],
+    popup=f"Riesgo {nodo_riesgo.get('nombre', nodo_riesgo_index)}",
+    icon=folium.Icon(color="red")
+).add_to(m)
+
+# Guardar el mapa como HTML
+m.save("nodos_en_mapa_de_riesgo_recursos_5km.html")
+print("Mapa creado con nodos de respuesta cercanos (5km) en verde y lejanos en negro. Archivo: nodos_en_mapa_de_riesgo_recursos_5km.html")
